@@ -1,0 +1,18 @@
+# render.yaml - Render.com deployment configuration
+services:
+  - type: web
+    name: ddl-arena-backend
+    env: node
+    region: oregon
+    plan: free
+    branch: main
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+    # Auto-deploy from GitHub when you push to main branch
+    autoDeploy: true
