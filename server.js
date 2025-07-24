@@ -14,7 +14,7 @@ const ALLOWED_ORIGINS = [
   'https://discorddartsleagues.netlify.app',
   'http://localhost:3000',
   'http://localhost:8080',
-  'http://127.0.0.1:5500', // Live Server
+  'http://127.0.0.1:5500',
   'http://localhost:5500'
 ];
 
@@ -52,6 +52,8 @@ const server = http.createServer(async (req, res) => {
   const method = req.method;
   const origin = req.headers.origin;
 
+  console.log(`${method} ${path}`); // Log all requests
+
   // Handle CORS preflight
   if (method === 'OPTIONS') {
     const corsOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : '*';
@@ -65,9 +67,40 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ROOT ROUTE - This fixes the "not found" error!
+  if (path === '/' && method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(`
+      <html>
+        <head><title>DDL Arena Backend</title></head>
+        <body style="font-family: Arial; padding: 20px; background: #1a1a1a; color: white;">
+          <h1>🎯 DDL Arena Backend Server</h1>
+          <p>✅ Server is running successfully!</p>
+          <p>🌐 Frontend: <a href="https://discorddartsleagues.netlify.app" style="color: #FFD700;">https://discorddartsleagues.netlify.app</a></p>
+          <h3>Available API Endpoints:</h3>
+          <ul>
+            <li><code>GET /api/health</code> - Health check</li>
+            <li><code>GET /api/rooms</code> - List all rooms</li>
+            <li><code>POST /api/rooms</code> - Create a new room</li>
+            <li><code>POST /api/rooms/{code}/join</code> - Join a room</li>
+            <li><code>GET /api/rooms/{code}</code> - Get room details</li>
+            <li><code>DELETE /api/rooms/{code}</code> - Delete a room</li>
+          </ul>
+          <p><small>Backend powered by Node.js + Supabase</small></p>
+          <p><small>Server time: ${new Date().toISOString()}</small></p>
+        </body>
+      </html>
+    `);
+    return;
+  }
+
   // Health check endpoint
   if (path === '/api/health' && method === 'GET') {
-    sendJSON(res, { status: 'healthy', timestamp: new Date().toISOString() }, 200, origin);
+    sendJSON(res, { 
+      status: 'healthy', 
+      timestamp: new Date().toISOString(),
+      server: 'DDL Arena Backend'
+    }, 200, origin);
     return;
   }
 
@@ -78,14 +111,16 @@ const server = http.createServer(async (req, res) => {
         .from('rooms')
         .select('*')
         .order('created', { ascending: false })
-        .limit(50); // Limit to prevent too much data
+        .limit(50);
 
       if (error) {
+        console.error('Supabase error:', error);
         sendJSON(res, { error: error.message }, 500, origin);
       } else {
         sendJSON(res, rooms || [], 200, origin);
       }
     } catch (err) {
+      console.error('Database error:', err);
       sendJSON(res, { error: 'Database error' }, 500, origin);
     }
     return;
@@ -148,8 +183,10 @@ const server = http.createServer(async (req, res) => {
 
       const { data, error } = await supabase.from('rooms').insert([room]).select();
       if (error) {
+        console.error('Insert error:', error);
         sendJSON(res, { error: error.message }, 500, origin);
       } else {
+        console.log('Room created:', roomCode);
         sendJSON(res, data[0], 201, origin);
       }
     });
@@ -171,7 +208,6 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // Get room
       const { data: rooms, error } = await supabase
         .from('rooms')
         .select('*')
@@ -184,7 +220,6 @@ const server = http.createServer(async (req, res) => {
 
       const room = rooms[0];
       
-      // Validation checks
       if (room.players >= room.max_players) {
         sendJSON(res, { error: 'Room is full' }, 400, origin);
         return;
@@ -200,7 +235,6 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // Update room
       const update = {
         players: 2,
         status: 'ready',
@@ -215,8 +249,10 @@ const server = http.createServer(async (req, res) => {
         .select();
 
       if (updateError) {
+        console.error('Update error:', updateError);
         sendJSON(res, { error: updateError.message }, 500, origin);
       } else {
+        console.log('User joined room:', code, username);
         sendJSON(res, updated[0], 200, origin);
       }
     });
@@ -260,10 +296,24 @@ const server = http.createServer(async (req, res) => {
   }
 
   // 404 for unmatched routes
-  sendJSON(res, { error: 'Not found' }, 404, origin);
+  console.log('404 - Route not found:', path);
+  sendJSON(res, { error: 'Not found', path: path }, 404, origin);
 });
 
 server.listen(PORT, () => {
   console.log(`🚀 DDL Arena Server is running on port ${PORT}`);
   console.log(`🌐 Allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
+});
+
+// Error handling
+server.on('error', (err) => {
+  console.error('Server error:', err);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err);
 });
