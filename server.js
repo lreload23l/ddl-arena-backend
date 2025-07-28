@@ -5,11 +5,9 @@ const { Server } = require('socket.io');
 
 const PORT = process.env.PORT || 3000;
 
-
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 DDL Arena Server is running on port ${PORT}`);
 });
-
 
 // Supabase initialization
 const SUPABASE_URL = process.env.SUPABASE_URL;
