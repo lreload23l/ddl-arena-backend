@@ -1,16 +1,8 @@
+
 const http = require('http');
 const url = require('url');
 const { createClient } = require('@supabase/supabase-js');
 const { Server } = require('socket.io');
-
-const server = http.createServer(async (req, res) => {
-  // ...
-});
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 DDL Arena Server is running on port ${PORT}`);
-});
 
 // Supabase initialization
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -109,7 +101,8 @@ io.on('connection', socket => {
   });
 });
 
-server.listen(PORT, () => {
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 DDL Arena Server is running on port ${PORT}`);
   console.log(`🌐 Allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
 });
