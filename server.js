@@ -80,6 +80,7 @@ const server = http.createServer(async (req, res) => {
       <p>Server is running successfully.</p>
       <p>Time: ${new Date().toISOString()}</p>
       <p>Environment: ${process.env.NODE_ENV || 'development'}</p>
+      <p>WebRTC Signaling: ✅ Enabled</p>
     `);
     return;
   }
@@ -90,7 +91,8 @@ const server = http.createServer(async (req, res) => {
       status: 'healthy', 
       timestamp: new Date().toISOString(), 
       server: 'DDL Arena Backend',
-      version: '1.0.0'
+      version: '1.0.0',
+      features: ['rooms', 'webrtc-signaling']
     }, 200, origin);
     return;
   }
@@ -354,7 +356,7 @@ const server = http.createServer(async (req, res) => {
   sendJSON(res, { error: 'Not found' }, 404, origin);
 });
 
-// Attach Socket.IO to the HTTP server
+// Enhanced Socket.IO setup with WebRTC signaling
 const io = new Server(server, {
   cors: {
     origin: ALLOWED_ORIGINS,
@@ -363,20 +365,165 @@ const io = new Server(server, {
   }
 });
 
-io.on('connection', socket => {
-  console.log('🔌 WebRTC client connected:', socket.id);
+// Store active video rooms and users
+const activeVideoRooms = new Map();
+const userSockets = new Map();
 
+io.on('connection', (socket) => {
+  console.log('🔌 Client connected:', socket.id);
+
+  // Legacy room functionality (keep for compatibility)
   socket.on('join-room', roomCode => {
+    console.log(`📱 Legacy join-room: ${socket.id} -> ${roomCode}`);
     socket.join(roomCode);
     socket.to(roomCode).emit('user-joined', socket.id);
   });
 
   socket.on('signal', ({ roomCode, data }) => {
+    console.log(`📡 Legacy signal: ${socket.id} -> ${roomCode}`);
     socket.to(roomCode).emit('signal', { sender: socket.id, data });
   });
 
+  // Enhanced WebRTC video room functionality
+  socket.on('join-video-room', (data) => {
+    const { roomId, username } = data;
+    console.log(`🎥 ${username} joining video room: ${roomId}`);
+
+    // Leave any previous room
+    socket.rooms.forEach(room => {
+      if (room !== socket.id) {
+        socket.leave(room);
+      }
+    });
+
+    // Join the new room
+    socket.join(roomId);
+    socket.roomId = roomId;
+    socket.username = username;
+
+    // Track user in room
+    if (!activeVideoRooms.has(roomId)) {
+      activeVideoRooms.set(roomId, new Set());
+    }
+    activeVideoRooms.get(roomId).add(socket.id);
+    userSockets.set(socket.id, { roomId, username });
+
+    // Notify others in room
+    socket.to(roomId).emit('user-joined', {
+      socketId: socket.id,
+      username: username
+    });
+
+    // Send current room users to the new user
+    const roomUsers = Array.from(activeVideoRooms.get(roomId))
+      .filter(id => id !== socket.id)
+      .map(id => ({
+        socketId: id,
+        username: userSockets.get(id)?.username
+      }));
+
+    socket.emit('room-users', roomUsers);
+
+    console.log(`✅ ${username} joined room ${roomId}. Total users: ${activeVideoRooms.get(roomId).size}`);
+  });
+
+  // WebRTC offer handling
+  socket.on('webrtc-offer', (data) => {
+    const { targetSocketId, offer } = data;
+    console.log(`📤 Relaying offer from ${socket.id} to ${targetSocketId}`);
+
+    socket.to(targetSocketId).emit('webrtc-offer', {
+      fromSocketId: socket.id,
+      offer: offer
+    });
+  });
+
+  // WebRTC answer handling
+  socket.on('webrtc-answer', (data) => {
+    const { targetSocketId, answer } = data;
+    console.log(`📥 Relaying answer from ${socket.id} to ${targetSocketId}`);
+
+    socket.to(targetSocketId).emit('webrtc-answer', {
+      fromSocketId: socket.id,
+      answer: answer
+    });
+  });
+
+  // ICE candidate handling
+  socket.on('webrtc-ice-candidate', (data) => {
+    const { targetSocketId, candidate } = data;
+    console.log(`🧊 Relaying ICE candidate from ${socket.id} to ${targetSocketId}`);
+
+    socket.to(targetSocketId).emit('webrtc-ice-candidate', {
+      fromSocketId: socket.id,
+      candidate: candidate
+    });
+  });
+
+  // Generic WebRTC signal handling (for flexibility)
+  socket.on('webrtc-signal', (data) => {
+    const { targetSocketId, signal, type } = data;
+    console.log(`📡 Relaying ${type} signal from ${socket.id} to ${targetSocketId}`);
+
+    socket.to(targetSocketId).emit('webrtc-signal', {
+      fromSocketId: socket.id,
+      signal: signal,
+      type: type
+    });
+  });
+
+  // Handle explicit leave room
+  socket.on('leave-video-room', () => {
+    const userInfo = userSockets.get(socket.id);
+    if (userInfo) {
+      const { roomId, username } = userInfo;
+
+      socket.leave(roomId);
+
+      // Remove from tracking
+      if (activeVideoRooms.has(roomId)) {
+        activeVideoRooms.get(roomId).delete(socket.id);
+        if (activeVideoRooms.get(roomId).size === 0) {
+          activeVideoRooms.delete(roomId);
+        }
+      }
+
+      // Notify others
+      socket.to(roomId).emit('user-left', {
+        socketId: socket.id,
+        username: username
+      });
+
+      userSockets.delete(socket.id);
+      console.log(`🚪 ${username} explicitly left room ${roomId}`);
+    }
+  });
+
+  // Handle disconnection
   socket.on('disconnect', () => {
-    console.log('❌ WebRTC client disconnected:', socket.id);
+    console.log('📴 Client disconnected:', socket.id);
+
+    const userInfo = userSockets.get(socket.id);
+    if (userInfo) {
+      const { roomId, username } = userInfo;
+
+      // Remove user from room tracking
+      if (activeVideoRooms.has(roomId)) {
+        activeVideoRooms.get(roomId).delete(socket.id);
+        if (activeVideoRooms.get(roomId).size === 0) {
+          activeVideoRooms.delete(roomId);
+        }
+      }
+
+      // Notify others in room
+      socket.to(roomId).emit('user-left', {
+        socketId: socket.id,
+        username: username
+      });
+
+      userSockets.delete(socket.id);
+      console.log(`👋 ${username} disconnected from room ${roomId}`);
+    }
   });
 });
 
@@ -385,6 +532,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 DDL Arena Server is running on port ${PORT}`);
   console.log(`🌐 Allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
   console.log(`🗄️ Database: ${SUPABASE_URL ? 'Supabase' : 'In-memory (fallback)'}`);
+  console.log(`🎥 WebRTC Signaling: ✅ Enhanced & Ready`);
 });
 
 server.on('error', (err) => {
