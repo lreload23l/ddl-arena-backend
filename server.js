@@ -99,21 +99,124 @@ async function getXirsysLiveSessions() {
   try {
     console.log('🔍 Fetching Xirsys live sessions...');
     
-    // Get subscription data (active connections)
-    const subsData = await xirsysApiCall('_subs');
+    // Try different Xirsys V3 endpoints for live session detection
+    let liveSessions = [];
     
-    // Get statistics data if available
-    let statsData = null;
+    // Method 1: Try the _host endpoint (for active channels)
     try {
-      statsData = await xirsysApiCall('_stats');
+      const hostData = await xirsysApiCall('_host');
+      console.log('📡 Host data:', hostData);
+      if (hostData && hostData.s === 'ok' && hostData.v) {
+        // Process host data for live sessions
+        if (Array.isArray(hostData.v)) {
+          hostData.v.forEach(host => {
+            if (host && host.channels) {
+              Object.keys(host.channels).forEach(channelKey => {
+                const channel = host.channels[channelKey];
+                if (channel && channel.users && Object.keys(channel.users).length > 0) {
+                  liveSessions.push({
+                    roomId: channelKey,
+                    roomCode: channelKey,
+                    participants: Object.keys(channel.users).map(userId => ({
+                      userId: userId,
+                      socketId: userId,
+                      connectionTime: new Date().toISOString(),
+                      connectionInfo: channel.users[userId]
+                    })),
+                    participantCount: Object.keys(channel.users).length,
+                    status: 'live',
+                    type: 'webrtc_call',
+                    startTime: new Date().toISOString(),
+                    platform: 'xirsys',
+                    lastUpdated: new Date().toISOString()
+                  });
+                }
+              });
+            }
+          });
+        }
+      }
     } catch (e) {
-      console.log('📊 Stats data not available, continuing without it');
+      console.log('📡 Host endpoint not available:', e.message);
     }
     
-    // Process the data
-    const liveSessions = processXirsysData(subsData, statsData);
-    console.log(`📊 Found ${liveSessions.length} live sessions`);
+    // Method 2: Try the _data endpoint (newer V3 API)
+    try {
+      const dataResponse = await xirsysApiCall('_data');
+      console.log('📊 Data endpoint response:', dataResponse);
+      if (dataResponse && dataResponse.s === 'ok' && dataResponse.v) {
+        // Process data response for active sessions
+        const dataValue = dataResponse.v;
+        if (typeof dataValue === 'object') {
+          Object.keys(dataValue).forEach(key => {
+            const sessionData = dataValue[key];
+            if (sessionData && typeof sessionData === 'object') {
+              const participants = Object.keys(sessionData).map(userId => ({
+                userId: userId,
+                socketId: userId,
+                connectionTime: new Date().toISOString(),
+                connectionInfo: sessionData[userId]
+              }));
+              
+              if (participants.length > 0) {
+                liveSessions.push({
+                  roomId: key,
+                  roomCode: key,
+                  participants: participants,
+                  participantCount: participants.length,
+                  status: 'live',
+                  type: 'webrtc_call',
+                  startTime: new Date().toISOString(),
+                  platform: 'xirsys',
+                  lastUpdated: new Date().toISOString()
+                });
+              }
+            }
+          });
+        }
+      }
+    } catch (e) {
+      console.log('📊 Data endpoint not available:', e.message);
+    }
     
+    // Method 3: Check the stats endpoint for different format
+    try {
+      const statsData = await xirsysApiCall('_stats');
+      console.log('📈 Stats data:', statsData);
+      if (statsData && statsData.s === 'ok' && statsData.v) {
+        const statsValue = statsData.v;
+        if (Array.isArray(statsValue) && statsValue.length > 0) {
+          statsValue.forEach(stat => {
+            if (stat && stat.active && stat.active > 0) {
+              liveSessions.push({
+                roomId: stat.channel || 'unknown',
+                roomCode: stat.channel || 'unknown',
+                participants: [],
+                participantCount: stat.active,
+                status: 'live',
+                type: 'webrtc_call',
+                startTime: new Date().toISOString(),
+                platform: 'xirsys',
+                lastUpdated: new Date().toISOString()
+              });
+            }
+          });
+        }
+      }
+    } catch (e) {
+      console.log('📈 Stats processing failed:', e.message);
+    }
+    
+    // Method 4: Try namespace endpoint to see active paths
+    try {
+      const nsData = await xirsysApiCall('_ns');
+      console.log('🗂️ Namespace data:', nsData);
+      // Namespace usually shows available paths, not active sessions
+    } catch (e) {
+      console.log('🗂️ Namespace endpoint error:', e.message);
+    }
+    
+    console.log(`📊 Found ${liveSessions.length} live sessions from Xirsys`);
     return liveSessions;
     
   } catch (error) {
@@ -303,20 +406,16 @@ const server = http.createServer(async (req, res) => {
         timestamp: new Date().toISOString()
       };
       
-      // Test subscription endpoint
-      try {
-        const subsData = await xirsysApiCall('_subs');
-        testResult.subsTest = { success: true, data: subsData };
-      } catch (e) {
-        testResult.subsTest = { success: false, error: e.message };
-      }
+      // Test different endpoints to find what works
+      const endpoints = ['_ns', '_data', '_host', '_stats', '_turn'];
       
-      // Test namespace endpoint
-      try {
-        const nsData = await xirsysApiCall('_ns');
-        testResult.nsTest = { success: true, data: nsData };
-      } catch (e) {
-        testResult.nsTest = { success: false, error: e.message };
+      for (const endpoint of endpoints) {
+        try {
+          const data = await xirsysApiCall(endpoint);
+          testResult[`${endpoint}Test`] = { success: true, data: data };
+        } catch (e) {
+          testResult[`${endpoint}Test`] = { success: false, error: e.message };
+        }
       }
       
       sendJSON(res, testResult, 200, origin);
