@@ -8,6 +8,14 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
+// Xirsys Configuration for DDL Arena
+const XIRSYS_CONFIG = {
+  ident: 'ddlarena',
+  secret: 'f6cd9c98-71fc-11f0-bc80-0242ac150003',
+  gateway: 'global.xirsys.net',
+  path: '/ddlarena/default/default'
+};
+
 // CORS configuration for your Netlify frontend
 const ALLOWED_ORIGINS = [
   'https://discorddartsleagues.netlify.app',
@@ -53,6 +61,171 @@ function generateRoomCode() {
   return Math.random().toString(36).substring(2, 7).toUpperCase();
 }
 
+// Xirsys API Functions
+async function xirsysApiCall(service, subPath = '') {
+  const { ident, secret, gateway, path } = XIRSYS_CONFIG;
+  const fullPath = `${path}${subPath}`;
+  const url = `https://${ident}:${secret}@${gateway}/${service}${fullPath}`;
+  
+  console.log(`🔍 Making Xirsys API call to: ${service}${fullPath}`);
+  
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    if (!response.ok) {
+      throw new Error(`Xirsys API error: ${response.status} - ${response.statusText}`);
+    }
+    
+    const data = await response.json();
+    console.log(`✅ Xirsys ${service} response:`, data);
+    return data;
+    
+  } catch (error) {
+    console.error(`❌ Xirsys API call failed for ${service}:`, error.message);
+    throw error;
+  }
+}
+
+async function getXirsysLiveSessions() {
+  try {
+    console.log('🔍 Fetching Xirsys live sessions...');
+    
+    // Get subscription data (active connections)
+    const subsData = await xirsysApiCall('_subs');
+    
+    // Get statistics data if available
+    let statsData = null;
+    try {
+      statsData = await xirsysApiCall('_stats');
+    } catch (e) {
+      console.log('📊 Stats data not available, continuing without it');
+    }
+    
+    // Process the data
+    const liveSessions = processXirsysData(subsData, statsData);
+    console.log(`📊 Found ${liveSessions.length} live sessions`);
+    
+    return liveSessions;
+    
+  } catch (error) {
+    console.error('❌ Failed to get Xirsys live sessions:', error);
+    return [];
+  }
+}
+
+function processXirsysData(subsData, statsData) {
+  const liveSessions = [];
+  
+  if (subsData && subsData.s === 'ok' && subsData.v) {
+    const subscriptionData = subsData.v;
+    
+    if (typeof subscriptionData === 'object') {
+      Object.keys(subscriptionData).forEach(roomKey => {
+        const roomData = subscriptionData[roomKey];
+        
+        if (roomData && typeof roomData === 'object') {
+          const participants = Object.keys(roomData).map(userId => ({
+            userId: userId,
+            socketId: userId,
+            connectionTime: roomData[userId]?.connected || new Date().toISOString(),
+            connectionInfo: roomData[userId]
+          }));
+          
+          if (participants.length > 0) {
+            liveSessions.push({
+              roomId: roomKey,
+              roomCode: roomKey,
+              participants: participants,
+              participantCount: participants.length,
+              status: 'live',
+              type: 'webrtc_call',
+              startTime: new Date().toISOString(),
+              platform: 'xirsys',
+              lastUpdated: new Date().toISOString()
+            });
+          }
+        }
+      });
+    }
+  }
+  
+  return liveSessions;
+}
+
+async function getCombinedLiveMatches() {
+  try {
+    // Get your local rooms
+    let rooms = [];
+    if (SUPABASE_URL && SUPABASE_KEY) {
+      const { data, error } = await supabase
+        .from('rooms')
+        .select('*')
+        .order('created', { ascending: false });
+      
+      if (!error) {
+        rooms = data || [];
+      }
+    } else {
+      rooms = global.rooms ? Array.from(global.rooms.values()) : [];
+    }
+    
+    // Get live Xirsys sessions
+    const xirsysLiveSessions = await getXirsysLiveSessions();
+    
+    // Create a map of live sessions by room code
+    const liveSessionMap = new Map();
+    xirsysLiveSessions.forEach(session => {
+      liveSessionMap.set(session.roomId, session);
+    });
+    
+    // Merge room data with live session data
+    const liveMatches = rooms.map(room => {
+      const liveSession = liveSessionMap.get(room.code);
+      
+      return {
+        ...room,
+        hasLiveSession: !!liveSession,
+        liveSession: liveSession,
+        actualParticipants: liveSession?.participantCount || 0,
+        status: liveSession ? 'live' : room.status,
+        xirsysStatus: liveSession ? 'connected' : 'disconnected'
+      };
+    });
+    
+    // Also include Xirsys sessions that don't match existing rooms
+    xirsysLiveSessions.forEach(session => {
+      const existingRoom = rooms.find(room => room.code === session.roomId);
+      if (!existingRoom) {
+        liveMatches.push({
+          code: session.roomId,
+          host: 'Unknown',
+          opponent: session.participantCount > 1 ? 'Unknown' : null,
+          players: session.participantCount,
+          max_players: 4,
+          status: 'live',
+          created: session.startTime,
+          hasLiveSession: true,
+          liveSession: session,
+          actualParticipants: session.participantCount,
+          xirsysStatus: 'connected',
+          isXirsysOnly: true
+        });
+      }
+    });
+    
+    return liveMatches;
+    
+  } catch (error) {
+    console.error('❌ Error getting combined live matches:', error);
+    throw error;
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   const parsedUrl = url.parse(req.url, true);
   const path = parsedUrl.pathname;
@@ -81,19 +254,120 @@ const server = http.createServer(async (req, res) => {
       <p>Time: ${new Date().toISOString()}</p>
       <p>Environment: ${process.env.NODE_ENV || 'development'}</p>
       <p>WebRTC Signaling: ✅ Enabled</p>
+      <p>Xirsys Integration: ✅ Active (${XIRSYS_CONFIG.ident})</p>
     `);
     return;
   }
 
-  // Health check endpoint
+  // Enhanced health check endpoint with Xirsys status
   if (path === '/api/health' && method === 'GET') {
+    let xirsysStatus = 'unknown';
+    try {
+      await xirsysApiCall('_subs');
+      xirsysStatus = 'connected';
+    } catch (e) {
+      xirsysStatus = 'error';
+    }
+    
     sendJSON(res, { 
       status: 'healthy', 
       timestamp: new Date().toISOString(), 
       server: 'DDL Arena Backend',
       version: '1.0.0',
-      features: ['rooms', 'webrtc-signaling']
+      features: ['rooms', 'webrtc-signaling', 'xirsys-integration'],
+      xirsys: {
+        status: xirsysStatus,
+        ident: XIRSYS_CONFIG.ident,
+        gateway: XIRSYS_CONFIG.gateway,
+        path: XIRSYS_CONFIG.path
+      }
     }, 200, origin);
+    return;
+  }
+
+  // Test Xirsys connection
+  if (path === '/api/xirsys/test' && method === 'GET') {
+    try {
+      console.log('🧪 Testing Xirsys connection...');
+      
+      const testResult = {
+        config: {
+          ident: XIRSYS_CONFIG.ident,
+          gateway: XIRSYS_CONFIG.gateway,
+          path: XIRSYS_CONFIG.path
+        },
+        timestamp: new Date().toISOString()
+      };
+      
+      // Test subscription endpoint
+      try {
+        const subsData = await xirsysApiCall('_subs');
+        testResult.subsTest = { success: true, data: subsData };
+      } catch (e) {
+        testResult.subsTest = { success: false, error: e.message };
+      }
+      
+      // Test namespace endpoint
+      try {
+        const nsData = await xirsysApiCall('_ns');
+        testResult.nsTest = { success: true, data: nsData };
+      } catch (e) {
+        testResult.nsTest = { success: false, error: e.message };
+      }
+      
+      sendJSON(res, testResult, 200, origin);
+      
+    } catch (error) {
+      console.error('❌ Xirsys test failed:', error);
+      sendJSON(res, { error: 'Xirsys test failed', details: error.message }, 500, origin);
+    }
+    return;
+  }
+
+  // Get live Xirsys sessions only
+  if (path === '/api/xirsys/live-sessions' && method === 'GET') {
+    try {
+      const liveSessions = await getXirsysLiveSessions();
+      sendJSON(res, liveSessions, 200, origin);
+    } catch (error) {
+      console.error('❌ Error fetching Xirsys live sessions:', error);
+      sendJSON(res, { error: 'Failed to fetch live sessions', details: error.message }, 500, origin);
+    }
+    return;
+  }
+
+  // Get combined live matches (your rooms + Xirsys data)
+  if (path === '/api/live-matches' && method === 'GET') {
+    try {
+      const liveMatches = await getCombinedLiveMatches();
+      sendJSON(res, liveMatches, 200, origin);
+    } catch (error) {
+      console.error('❌ Error fetching live matches:', error);
+      sendJSON(res, { error: 'Failed to fetch live matches', details: error.message }, 500, origin);
+    }
+    return;
+  }
+
+  // Check specific room status in Xirsys
+  if (path.startsWith('/api/xirsys/room/') && method === 'GET') {
+    const roomId = path.split('/')[4];
+    
+    try {
+      const roomData = await xirsysApiCall('_subs', `/${roomId}`);
+      const isLive = roomData && roomData.v && Object.keys(roomData.v || {}).length > 0;
+      
+      sendJSON(res, {
+        roomId: roomId,
+        isLive: isLive,
+        participants: isLive ? Object.keys(roomData.v || {}) : [],
+        participantCount: isLive ? Object.keys(roomData.v || {}).length : 0,
+        xirsysData: roomData
+      }, 200, origin);
+      
+    } catch (error) {
+      console.error(`❌ Error checking room ${roomId} status:`, error);
+      sendJSON(res, { error: 'Failed to check room status', details: error.message }, 500, origin);
+    }
     return;
   }
 
@@ -533,6 +807,10 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`🌐 Allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
   console.log(`🗄️ Database: ${SUPABASE_URL ? 'Supabase' : 'In-memory (fallback)'}`);
   console.log(`🎥 WebRTC Signaling: ✅ Enhanced & Ready`);
+  console.log(`🎯 Xirsys Integration: ✅ Active`);
+  console.log(`   - Ident: ${XIRSYS_CONFIG.ident}`);
+  console.log(`   - Gateway: ${XIRSYS_CONFIG.gateway}`);
+  console.log(`   - Path: ${XIRSYS_CONFIG.path}`);
 });
 
 server.on('error', (err) => {
