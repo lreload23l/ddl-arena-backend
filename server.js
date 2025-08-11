@@ -65,7 +65,10 @@ function generateRoomCode() {
 async function xirsysApiCall(service, subPath = '') {
   const { ident, secret, gateway, path } = XIRSYS_CONFIG;
   const fullPath = `${path}${subPath}`;
-  const url = `https://${ident}:${secret}@${gateway}/${service}${fullPath}`;
+  const url = `https://${gateway}/${service}${fullPath}`;
+  
+  // Create Basic Auth header
+  const credentials = Buffer.from(`${ident}:${secret}`).toString('base64');
   
   console.log(`🔍 Making Xirsys API call to: ${service}${fullPath}`);
   
@@ -73,6 +76,7 @@ async function xirsysApiCall(service, subPath = '') {
     const response = await fetch(url, {
       method: 'GET',
       headers: {
+        'Authorization': `Basic ${credentials}`,
         'Content-Type': 'application/json'
       }
     });
