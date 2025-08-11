@@ -13,7 +13,7 @@ const XIRSYS_CONFIG = {
   ident: 'ddlarena',
   secret: 'f6cd9c98-71fc-11f0-bc80-0242ac150003',
   gateway: 'global.xirsys.net',
-  path: '/ddlarena/default/default'
+  path: '/ddlarena'  // Simplified path - let Xirsys create default structure
 };
 
 // CORS configuration for your Netlify frontend
@@ -62,7 +62,7 @@ function generateRoomCode() {
 }
 
 // Xirsys API Functions
-async function xirsysApiCall(service, subPath = '') {
+async function xirsysApiCall(service, subPath = '', method = 'GET') {
   const { ident, secret, gateway, path } = XIRSYS_CONFIG;
   const fullPath = `${path}${subPath}`;
   const url = `https://${gateway}/${service}${fullPath}`;
@@ -70,11 +70,11 @@ async function xirsysApiCall(service, subPath = '') {
   // Create Basic Auth header
   const credentials = Buffer.from(`${ident}:${secret}`).toString('base64');
   
-  console.log(`🔍 Making Xirsys API call to: ${service}${fullPath}`);
+  console.log(`🔍 Making Xirsys API call to: ${service}${fullPath} (${method})`);
   
   try {
     const response = await fetch(url, {
-      method: 'GET',
+      method: method,
       headers: {
         'Authorization': `Basic ${credentials}`,
         'Content-Type': 'application/json'
@@ -99,100 +99,67 @@ async function getXirsysLiveSessions() {
   try {
     console.log('🔍 Fetching Xirsys live sessions...');
     
-    // Try different Xirsys V3 endpoints for live session detection
     let liveSessions = [];
     
-    // Method 1: Try the _host endpoint (for active channels)
+    // First, try to ensure the namespace exists
     try {
-      const hostData = await xirsysApiCall('_host');
-      console.log('📡 Host data:', hostData);
-      if (hostData && hostData.s === 'ok' && hostData.v) {
-        // Process host data for live sessions
-        if (Array.isArray(hostData.v)) {
-          hostData.v.forEach(host => {
-            if (host && host.channels) {
-              Object.keys(host.channels).forEach(channelKey => {
-                const channel = host.channels[channelKey];
-                if (channel && channel.users && Object.keys(channel.users).length > 0) {
-                  liveSessions.push({
-                    roomId: channelKey,
-                    roomCode: channelKey,
-                    participants: Object.keys(channel.users).map(userId => ({
-                      userId: userId,
-                      socketId: userId,
-                      connectionTime: new Date().toISOString(),
-                      connectionInfo: channel.users[userId]
-                    })),
-                    participantCount: Object.keys(channel.users).length,
-                    status: 'live',
-                    type: 'webrtc_call',
-                    startTime: new Date().toISOString(),
-                    platform: 'xirsys',
-                    lastUpdated: new Date().toISOString()
-                  });
-                }
+      console.log('🏗️ Ensuring Xirsys namespace exists...');
+      const createNs = await xirsysApiCall('_ns', '', 'PUT');
+      console.log('🏗️ Namespace creation result:', createNs);
+    } catch (e) {
+      console.log('🏗️ Namespace creation skipped:', e.message);
+    }
+    
+    // Method 1: Check TURN service activity (most reliable for active calls)
+    try {
+      const turnData = await xirsysApiCall('_turn');
+      console.log('🔄 TURN data:', turnData);
+      if (turnData && turnData.s === 'ok' && turnData.v) {
+        // TURN service shows active ICE sessions
+        if (turnData.v.iceServers || turnData.v.length > 0) {
+          console.log('🔄 TURN service indicates potential active sessions');
+        }
+      }
+    } catch (e) {
+      console.log('🔄 TURN endpoint not accessible:', e.message);
+    }
+    
+    // Method 2: Check stats for any activity
+    try {
+      const statsData = await xirsysApiCall('_stats');
+      console.log('📈 Full stats response:', JSON.stringify(statsData, null, 2));
+      
+      if (statsData && statsData.s === 'ok') {
+        if (Array.isArray(statsData.v) && statsData.v.length > 0) {
+          // Process stats data
+          statsData.v.forEach((stat, index) => {
+            console.log(`📊 Stat ${index}:`, stat);
+            if (stat && (stat.active > 0 || stat.sessions > 0 || stat.users > 0)) {
+              liveSessions.push({
+                roomId: stat.path || stat.channel || `session_${index}`,
+                roomCode: stat.path || stat.channel || `session_${index}`,
+                participants: [],
+                participantCount: stat.active || stat.users || 1,
+                status: 'live',
+                type: 'webrtc_call',
+                startTime: new Date().toISOString(),
+                platform: 'xirsys',
+                lastUpdated: new Date().toISOString(),
+                statData: stat
               });
             }
           });
-        }
-      }
-    } catch (e) {
-      console.log('📡 Host endpoint not available:', e.message);
-    }
-    
-    // Method 2: Try the _data endpoint (newer V3 API)
-    try {
-      const dataResponse = await xirsysApiCall('_data');
-      console.log('📊 Data endpoint response:', dataResponse);
-      if (dataResponse && dataResponse.s === 'ok' && dataResponse.v) {
-        // Process data response for active sessions
-        const dataValue = dataResponse.v;
-        if (typeof dataValue === 'object') {
-          Object.keys(dataValue).forEach(key => {
-            const sessionData = dataValue[key];
-            if (sessionData && typeof sessionData === 'object') {
-              const participants = Object.keys(sessionData).map(userId => ({
-                userId: userId,
-                socketId: userId,
-                connectionTime: new Date().toISOString(),
-                connectionInfo: sessionData[userId]
-              }));
-              
-              if (participants.length > 0) {
-                liveSessions.push({
-                  roomId: key,
-                  roomCode: key,
-                  participants: participants,
-                  participantCount: participants.length,
-                  status: 'live',
-                  type: 'webrtc_call',
-                  startTime: new Date().toISOString(),
-                  platform: 'xirsys',
-                  lastUpdated: new Date().toISOString()
-                });
-              }
-            }
-          });
-        }
-      }
-    } catch (e) {
-      console.log('📊 Data endpoint not available:', e.message);
-    }
-    
-    // Method 3: Check the stats endpoint for different format
-    try {
-      const statsData = await xirsysApiCall('_stats');
-      console.log('📈 Stats data:', statsData);
-      if (statsData && statsData.s === 'ok' && statsData.v) {
-        const statsValue = statsData.v;
-        if (Array.isArray(statsValue) && statsValue.length > 0) {
-          statsValue.forEach(stat => {
-            if (stat && stat.active && stat.active > 0) {
+        } else if (statsData.v && typeof statsData.v === 'object') {
+          // Handle object format stats
+          Object.keys(statsData.v).forEach(key => {
+            const value = statsData.v[key];
+            console.log(`📊 Stats key ${key}:`, value);
+            if (value && value > 0) {
               liveSessions.push({
-                roomId: stat.channel || 'unknown',
-                roomCode: stat.channel || 'unknown',
+                roomId: key,
+                roomCode: key,
                 participants: [],
-                participantCount: stat.active,
+                participantCount: value,
                 status: 'live',
                 type: 'webrtc_call',
                 startTime: new Date().toISOString(),
@@ -207,16 +174,21 @@ async function getXirsysLiveSessions() {
       console.log('📈 Stats processing failed:', e.message);
     }
     
-    // Method 4: Try namespace endpoint to see active paths
+    // Method 3: Try simpler namespace check
     try {
-      const nsData = await xirsysApiCall('_ns');
-      console.log('🗂️ Namespace data:', nsData);
-      // Namespace usually shows available paths, not active sessions
+      const nsData = await xirsysApiCall('_ns', '');
+      console.log('🗂️ Root namespace check:', nsData);
     } catch (e) {
-      console.log('🗂️ Namespace endpoint error:', e.message);
+      console.log('🗂️ Root namespace error:', e.message);
     }
     
     console.log(`📊 Found ${liveSessions.length} live sessions from Xirsys`);
+    
+    // For testing: Create a mock session when your match.html is used
+    if (liveSessions.length === 0) {
+      console.log('🧪 No live sessions detected - this is normal if no video calls are active');
+    }
+    
     return liveSessions;
     
   } catch (error) {
