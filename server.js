@@ -399,7 +399,45 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Get live Xirsys sessions only
+  // Get ICE servers from Xirsys for WebRTC
+  if (path === '/api/ice-servers' && method === 'GET') {
+    try {
+      console.log('🧊 Getting ICE servers from Xirsys...');
+      
+      // Try to get TURN servers from Xirsys
+      try {
+        const turnData = await xirsysApiCall('_turn', '', 'PUT');
+        console.log('🔄 Xirsys TURN response:', turnData);
+        
+        if (turnData && turnData.s === 'ok' && turnData.v && turnData.v.iceServers) {
+          sendJSON(res, {
+            iceServers: turnData.v.iceServers
+          }, 200, origin);
+          return;
+        }
+      } catch (e) {
+        console.log('🔄 Xirsys TURN failed, using fallback:', e.message);
+      }
+      
+      // Fallback ICE servers if Xirsys doesn't work
+      const fallbackIceServers = {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+          { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' }
+        ]
+      };
+      
+      console.log('🧊 Using fallback ICE servers');
+      sendJSON(res, fallbackIceServers, 200, origin);
+      
+    } catch (error) {
+      console.error('❌ Error getting ICE servers:', error);
+      sendJSON(res, { error: 'Failed to get ICE servers' }, 500, origin);
+    }
+    return;
+  }
   if (path === '/api/xirsys/live-sessions' && method === 'GET') {
     try {
       const liveSessions = await getXirsysLiveSessions();
