@@ -61,6 +61,126 @@ function generateRoomCode() {
   return Math.random().toString(36).substring(2, 7).toUpperCase();
 }
 
+// Store active video rooms and users
+const activeVideoRooms = new Map();
+const userSockets = new Map();
+const roomLifecycle = new Map(); // roomCode -> { created, lastActivity, status, participants }
+
+// Database helper functions for room cleanup
+async function updateRoomStatus(roomCode, status, participantCount) {
+  try {
+    if (SUPABASE_URL && SUPABASE_KEY) {
+      // Update in Supabase
+      const { error } = await supabase
+        .from('rooms')
+        .update({
+          status: status,
+          players: participantCount,
+          last_activity: new Date().toISOString(),
+          is_live: participantCount > 0
+        })
+        .eq('code', roomCode);
+      
+      if (error) {
+        console.error('Failed to update room status:', error);
+      }
+    } else {
+      // Update in-memory storage
+      if (global.rooms && global.rooms.has(roomCode)) {
+        const room = global.rooms.get(roomCode);
+        room.status = status;
+        room.players = participantCount;
+        room.last_activity = new Date().toISOString();
+        room.is_live = participantCount > 0;
+      }
+    }
+  } catch (error) {
+    console.error('Error updating room status:', error);
+  }
+}
+
+async function cleanupRoom(roomCode) {
+  try {
+    console.log(`🗑️ Cleaning up room ${roomCode}`);
+    
+    if (SUPABASE_URL && SUPABASE_KEY) {
+      // Delete the room completely
+      const { error } = await supabase
+        .from('rooms')
+        .delete()
+        .eq('code', roomCode);
+      
+      if (error) {
+        console.error('Failed to cleanup room:', error);
+      }
+    } else {
+      // Remove from in-memory storage
+      if (global.rooms) {
+        global.rooms.delete(roomCode);
+      }
+    }
+    
+    // Clean up lifecycle tracking
+    roomLifecycle.delete(roomCode);
+    
+  } catch (error) {
+    console.error('Error cleaning up room:', error);
+  }
+}
+
+async function handleUserLeaveRoom(socket, io) {
+  const userInfo = userSockets.get(socket.id);
+  if (!userInfo) return;
+
+  const { roomId, username } = userInfo;
+
+  // Remove user from room
+  socket.leave(roomId);
+
+  // Remove from tracking
+  if (activeVideoRooms.has(roomId)) {
+    activeVideoRooms.get(roomId).delete(socket.id);
+    
+    const remainingUsers = activeVideoRooms.get(roomId).size;
+    
+    if (remainingUsers === 0) {
+      // Room is empty - clean it up
+      activeVideoRooms.delete(roomId);
+      
+      // Update lifecycle
+      if (roomLifecycle.has(roomId)) {
+        const lifecycle = roomLifecycle.get(roomId);
+        lifecycle.status = 'ended';
+        lifecycle.participants.delete(socket.id);
+      }
+      
+      // Delete or mark as ended in database
+      await cleanupRoom(roomId);
+      
+      console.log(`🧹 Room ${roomId} is empty - cleaned up`);
+    } else {
+      // Update room with remaining participants
+      await updateRoomStatus(roomId, 'active', remainingUsers);
+      
+      // Update lifecycle
+      if (roomLifecycle.has(roomId)) {
+        const lifecycle = roomLifecycle.get(roomId);
+        lifecycle.lastActivity = new Date();
+        lifecycle.participants.delete(socket.id);
+      }
+    }
+  }
+
+  // Notify others
+  socket.to(roomId).emit('user-left', {
+    socketId: socket.id,
+    username: username
+  });
+
+  userSockets.delete(socket.id);
+  console.log(`🚪 ${username} left room ${roomId}`);
+}
+
 // Xirsys API Functions
 async function xirsysApiCall(service, subPath = '', method = 'GET') {
   const { ident, secret, gateway, path } = XIRSYS_CONFIG;
@@ -244,13 +364,14 @@ async function getCombinedLiveMatches() {
       const { data, error } = await supabase
         .from('rooms')
         .select('*')
+        .neq('status', 'ended') // Filter out ended rooms
         .order('created', { ascending: false });
       
       if (!error) {
         rooms = data || [];
       }
     } else {
-      rooms = global.rooms ? Array.from(global.rooms.values()) : [];
+      rooms = global.rooms ? Array.from(global.rooms.values()).filter(r => r.status !== 'ended') : [];
     }
     
     // Get live Xirsys sessions
@@ -262,16 +383,19 @@ async function getCombinedLiveMatches() {
       liveSessionMap.set(session.roomId, session);
     });
     
-    // Merge room data with live session data
+    // Merge room data with live session data and active video rooms
     const liveMatches = rooms.map(room => {
       const liveSession = liveSessionMap.get(room.code);
+      const activeParticipants = activeVideoRooms.has(room.code) 
+        ? activeVideoRooms.get(room.code).size 
+        : 0;
       
       return {
         ...room,
-        hasLiveSession: !!liveSession,
+        hasLiveSession: activeParticipants > 0 || !!liveSession,
         liveSession: liveSession,
-        actualParticipants: liveSession?.participantCount || 0,
-        status: liveSession ? 'live' : room.status,
+        actualParticipants: activeParticipants || liveSession?.participantCount || 0,
+        status: activeParticipants > 0 ? 'live' : (liveSession ? 'live' : room.status),
         xirsysStatus: liveSession ? 'connected' : 'disconnected'
       };
     });
@@ -334,6 +458,7 @@ const server = http.createServer(async (req, res) => {
       <p>Environment: ${process.env.NODE_ENV || 'development'}</p>
       <p>WebRTC Signaling: ✅ Enabled</p>
       <p>Xirsys Integration: ✅ Active (${XIRSYS_CONFIG.ident})</p>
+      <p>Room Cleanup: ✅ Automatic</p>
     `);
     return;
   }
@@ -352,14 +477,15 @@ const server = http.createServer(async (req, res) => {
       status: 'healthy', 
       timestamp: new Date().toISOString(), 
       server: 'DDL Arena Backend',
-      version: '1.0.0',
-      features: ['rooms', 'webrtc-signaling', 'xirsys-integration'],
+      version: '1.1.0',
+      features: ['rooms', 'webrtc-signaling', 'xirsys-integration', 'auto-cleanup'],
       xirsys: {
         status: xirsysStatus,
         ident: XIRSYS_CONFIG.ident,
         gateway: XIRSYS_CONFIG.gateway,
         path: XIRSYS_CONFIG.path
-      }
+      },
+      activeRooms: activeVideoRooms.size
     }, 200, origin);
     return;
   }
@@ -438,6 +564,7 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
+
   if (path === '/api/xirsys/live-sessions' && method === 'GET') {
     try {
       const liveSessions = await getXirsysLiveSessions();
@@ -514,7 +641,8 @@ const server = http.createServer(async (req, res) => {
             setsToWin: 1,
             doubleOut: true
           },
-          created: new Date().toISOString()
+          created: new Date().toISOString(),
+          is_live: false
         };
 
         console.log('Creating room:', roomData);
@@ -548,7 +676,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Get rooms endpoint
+  // Get rooms endpoint - filters out ended rooms
   if (path === '/api/rooms' && method === 'GET') {
     try {
       let rooms = [];
@@ -557,6 +685,7 @@ const server = http.createServer(async (req, res) => {
         const { data, error } = await supabase
           .from('rooms')
           .select('*')
+          .neq('status', 'ended') // Filter out ended rooms
           .order('created', { ascending: false });
 
         if (error) {
@@ -569,9 +698,19 @@ const server = http.createServer(async (req, res) => {
       } else {
         // In-memory storage fallback
         if (global.rooms) {
-          rooms = Array.from(global.rooms.values());
+          rooms = Array.from(global.rooms.values())
+            .filter(room => room.status !== 'ended'); // Filter out ended rooms
         }
       }
+
+      // Add real-time participant counts from active video rooms
+      rooms = rooms.map(room => ({
+        ...room,
+        actualParticipants: activeVideoRooms.has(room.code) 
+          ? activeVideoRooms.get(room.code).size 
+          : 0,
+        hasLiveSession: activeVideoRooms.has(room.code) && activeVideoRooms.get(room.code).size > 0
+      }));
 
       sendJSON(res, rooms, 200, origin);
 
@@ -739,6 +878,38 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Add an explicit end-call endpoint for clean disconnects
+  if (path === '/api/rooms/end-call' && method === 'POST') {
+    parseBody(req, async (err, body) => {
+      if (err) {
+        sendJSON(res, { error: 'Invalid JSON' }, 400, origin);
+        return;
+      }
+
+      try {
+        const { roomCode } = body;
+        
+        if (!roomCode) {
+          sendJSON(res, { error: 'Room code is required' }, 400, origin);
+          return;
+        }
+
+        // Clean up the room
+        await cleanupRoom(roomCode);
+        
+        // Notify all clients in the room via Socket.IO
+        io.to(roomCode).emit('room-ended', { roomCode });
+        
+        sendJSON(res, { message: 'Room ended successfully' }, 200, origin);
+        
+      } catch (error) {
+        console.error('End call error:', error);
+        sendJSON(res, { error: 'Internal server error' }, 500, origin);
+      }
+    });
+    return;
+  }
+
   // 404 for unmatched routes
   sendJSON(res, { error: 'Not found' }, 404, origin);
 });
@@ -751,10 +922,6 @@ const io = new Server(server, {
     credentials: true
   }
 });
-
-// Store active video rooms and users
-const activeVideoRooms = new Map();
-const userSockets = new Map();
 
 io.on('connection', (socket) => {
   console.log('🔌 Client connected:', socket.id);
@@ -771,8 +938,8 @@ io.on('connection', (socket) => {
     socket.to(roomCode).emit('signal', { sender: socket.id, data });
   });
 
-  // Enhanced WebRTC video room functionality
-  socket.on('join-video-room', (data) => {
+  // Enhanced WebRTC video room functionality with cleanup
+  socket.on('join-video-room', async (data) => {
     const { roomId, username } = data;
     console.log(`🎥 ${username} joining video room: ${roomId}`);
 
@@ -794,6 +961,22 @@ io.on('connection', (socket) => {
     }
     activeVideoRooms.get(roomId).add(socket.id);
     userSockets.set(socket.id, { roomId, username });
+
+    // Update room lifecycle
+    if (!roomLifecycle.has(roomId)) {
+      roomLifecycle.set(roomId, {
+        created: new Date(),
+        lastActivity: new Date(),
+        status: 'active',
+        participants: new Set()
+      });
+    }
+    const lifecycle = roomLifecycle.get(roomId);
+    lifecycle.lastActivity = new Date();
+    lifecycle.participants.add(socket.id);
+
+    // Update room status in database
+    await updateRoomStatus(roomId, 'active', activeVideoRooms.get(roomId).size);
 
     // Notify others in room
     socket.to(roomId).emit('user-joined', {
@@ -860,59 +1043,60 @@ io.on('connection', (socket) => {
   });
 
   // Handle explicit leave room
-  socket.on('leave-video-room', () => {
-    const userInfo = userSockets.get(socket.id);
-    if (userInfo) {
-      const { roomId, username } = userInfo;
+  socket.on('leave-room', async () => {
+    await handleUserLeaveRoom(socket, io);
+  });
 
-      socket.leave(roomId);
-
-      // Remove from tracking
-      if (activeVideoRooms.has(roomId)) {
-        activeVideoRooms.get(roomId).delete(socket.id);
-        if (activeVideoRooms.get(roomId).size === 0) {
-          activeVideoRooms.delete(roomId);
-        }
-      }
-
-      // Notify others
-      socket.to(roomId).emit('user-left', {
-        socketId: socket.id,
-        username: username
-      });
-
-      userSockets.delete(socket.id);
-      console.log(`🚪 ${username} explicitly left room ${roomId}`);
-    }
+  // Handle explicit leave video room
+  socket.on('leave-video-room', async () => {
+    await handleUserLeaveRoom(socket, io);
   });
 
   // Handle disconnection
-  socket.on('disconnect', () => {
+  socket.on('disconnect', async () => {
     console.log('📴 Client disconnected:', socket.id);
-
-    const userInfo = userSockets.get(socket.id);
-    if (userInfo) {
-      const { roomId, username } = userInfo;
-
-      // Remove user from room tracking
-      if (activeVideoRooms.has(roomId)) {
-        activeVideoRooms.get(roomId).delete(socket.id);
-        if (activeVideoRooms.get(roomId).size === 0) {
-          activeVideoRooms.delete(roomId);
-        }
-      }
-
-      // Notify others in room
-      socket.to(roomId).emit('user-left', {
-        socketId: socket.id,
-        username: username
-      });
-
-      userSockets.delete(socket.id);
-      console.log(`👋 ${username} disconnected from room ${roomId}`);
-    }
+    await handleUserLeaveRoom(socket, io);
   });
 });
+
+// Periodic cleanup for stale rooms
+setInterval(async () => {
+  console.log('🔄 Running periodic room cleanup...');
+  
+  const now = Date.now();
+  const STALE_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+  
+  // Clean up stale rooms in lifecycle tracker
+  for (const [roomId, lifecycle] of roomLifecycle.entries()) {
+    const lastActivity = lifecycle.lastActivity.getTime();
+    
+    if (lifecycle.status === 'ended' || 
+        (lifecycle.participants.size === 0 && now - lastActivity > STALE_TIMEOUT)) {
+      await cleanupRoom(roomId);
+      console.log(`🧹 Cleaned up stale room: ${roomId}`);
+    }
+  }
+  
+  // Also clean up database rooms marked as ended or inactive
+  if (SUPABASE_URL && SUPABASE_KEY) {
+    try {
+      // Delete rooms that have been ended for more than 30 minutes
+      const thirtyMinutesAgo = new Date(now - STALE_TIMEOUT).toISOString();
+      
+      const { error } = await supabase
+        .from('rooms')
+        .delete()
+        .or(`status.eq.ended,and(is_live.eq.false,last_activity.lt.${thirtyMinutesAgo})`);
+      
+      if (error) {
+        console.error('Failed to clean up stale rooms:', error);
+      }
+    } catch (error) {
+      console.error('Error in periodic cleanup:', error);
+    }
+  }
+  
+}, 5 * 60 * 1000); // Run every 5 minutes
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
@@ -924,6 +1108,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`   - Ident: ${XIRSYS_CONFIG.ident}`);
   console.log(`   - Gateway: ${XIRSYS_CONFIG.gateway}`);
   console.log(`   - Path: ${XIRSYS_CONFIG.path}`);
+  console.log(`🧹 Auto-cleanup: ✅ Enabled (5 min intervals)`);
 });
 
 server.on('error', (err) => {
