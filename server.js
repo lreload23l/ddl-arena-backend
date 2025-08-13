@@ -1,5 +1,3 @@
-// server.js
-
 const http = require('http');
 const url = require('url');
 const { createClient } = require('@supabase/supabase-js');
@@ -10,15 +8,15 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// Xirsys Configuration
+// Xirsys Configuration for DDL Arena
 const XIRSYS_CONFIG = {
   ident: 'ddlarena',
   secret: 'f6cd9c98-71fc-11f0-bc80-0242ac150003',
   gateway: 'global.xirsys.net',
-  path: '/ddlarena'
+  path: '/ddlarena'  // Simplified path - let Xirsys create default structure
 };
 
-// Allowed CORS Origins
+// CORS configuration for your Netlify frontend
 const ALLOWED_ORIGINS = [
   'https://discorddartsleagues.netlify.app',
   'http://localhost:3000',
@@ -27,6 +25,7 @@ const ALLOWED_ORIGINS = [
   'http://127.0.0.1:8080'
 ];
 
+// Utility functions
 function setCORSHeaders(res, origin = null) {
   const corsOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
   res.setHeader('Access-Control-Allow-Origin', corsOrigin);
@@ -37,13 +36,17 @@ function setCORSHeaders(res, origin = null) {
 
 function sendJSON(res, data, statusCode = 200, origin = null) {
   setCORSHeaders(res, origin);
-  res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+  res.writeHead(statusCode, {
+    'Content-Type': 'application/json'
+  });
   res.end(JSON.stringify(data));
 }
 
 function parseBody(req, callback) {
   let body = '';
-  req.on('data', chunk => (body += chunk.toString()));
+  req.on('data', chunk => {
+    body += chunk.toString();
+  });
   req.on('end', () => {
     try {
       callback(null, JSON.parse(body || '{}'));
@@ -53,48 +56,349 @@ function parseBody(req, callback) {
   });
 }
 
+// Generate room code
 function generateRoomCode() {
   return Math.random().toString(36).substring(2, 7).toUpperCase();
 }
 
+// Store active video rooms and users
 const activeVideoRooms = new Map();
 const userSockets = new Map();
-const roomLifecycle = new Map();
+const roomLifecycle = new Map(); // roomCode -> { created, lastActivity, status, participants }
 
-// Xirsys API Call
+// Database helper functions for room cleanup
+async function updateRoomStatus(roomCode, status, participantCount) {
+  try {
+    if (SUPABASE_URL && SUPABASE_KEY) {
+      // Update in Supabase
+      const { error } = await supabase
+        .from('rooms')
+        .update({
+          status: status,
+          players: participantCount,
+          last_activity: new Date().toISOString(),
+          is_live: participantCount > 0
+        })
+        .eq('code', roomCode);
+      
+      if (error) {
+        console.error('Failed to update room status:', error);
+      }
+    } else {
+      // Update in-memory storage
+      if (global.rooms && global.rooms.has(roomCode)) {
+        const room = global.rooms.get(roomCode);
+        room.status = status;
+        room.players = participantCount;
+        room.last_activity = new Date().toISOString();
+        room.is_live = participantCount > 0;
+      }
+    }
+  } catch (error) {
+    console.error('Error updating room status:', error);
+  }
+}
+
+async function cleanupRoom(roomCode) {
+  try {
+    console.log(`🗑️ Cleaning up room ${roomCode}`);
+    
+    if (SUPABASE_URL && SUPABASE_KEY) {
+      // Delete the room completely
+      const { error } = await supabase
+        .from('rooms')
+        .delete()
+        .eq('code', roomCode);
+      
+      if (error) {
+        console.error('Failed to cleanup room:', error);
+      }
+    } else {
+      // Remove from in-memory storage
+      if (global.rooms) {
+        global.rooms.delete(roomCode);
+      }
+    }
+    
+    // Clean up lifecycle tracking
+    roomLifecycle.delete(roomCode);
+    
+  } catch (error) {
+    console.error('Error cleaning up room:', error);
+  }
+}
+
+async function handleUserLeaveRoom(socket, io) {
+  const userInfo = userSockets.get(socket.id);
+  if (!userInfo) return;
+
+  const { roomId, username } = userInfo;
+
+  // Remove user from room
+  socket.leave(roomId);
+
+  // Remove from tracking
+  if (activeVideoRooms.has(roomId)) {
+    activeVideoRooms.get(roomId).delete(socket.id);
+    
+    const remainingUsers = activeVideoRooms.get(roomId).size;
+    
+    if (remainingUsers === 0) {
+      // Room is empty - clean it up
+      activeVideoRooms.delete(roomId);
+      
+      // Update lifecycle
+      if (roomLifecycle.has(roomId)) {
+        const lifecycle = roomLifecycle.get(roomId);
+        lifecycle.status = 'ended';
+        lifecycle.participants.delete(socket.id);
+      }
+      
+      // Delete or mark as ended in database
+      await cleanupRoom(roomId);
+      
+      console.log(`🧹 Room ${roomId} is empty - cleaned up`);
+    } else {
+      // Update room with remaining participants
+      await updateRoomStatus(roomId, 'active', remainingUsers);
+      
+      // Update lifecycle
+      if (roomLifecycle.has(roomId)) {
+        const lifecycle = roomLifecycle.get(roomId);
+        lifecycle.lastActivity = new Date();
+        lifecycle.participants.delete(socket.id);
+      }
+    }
+  }
+
+  // Notify others
+  socket.to(roomId).emit('user-left', {
+    socketId: socket.id,
+    username: username
+  });
+
+  userSockets.delete(socket.id);
+  console.log(`🚪 ${username} left room ${roomId}`);
+}
+
+// Xirsys API Functions
 async function xirsysApiCall(service, subPath = '', method = 'GET') {
   const { ident, secret, gateway, path } = XIRSYS_CONFIG;
   const fullPath = `${path}${subPath}`;
-  const apiUrl = `https://${gateway}/${service}${fullPath}`;
+  const url = `https://${gateway}/${service}${fullPath}`;
+  
+  // Create Basic Auth header
   const credentials = Buffer.from(`${ident}:${secret}`).toString('base64');
-
+  
+  console.log(`🔍 Making Xirsys API call to: ${service}${fullPath} (${method})`);
+  
   try {
-    const response = await fetch(apiUrl, {
-      method,
+    const response = await fetch(url, {
+      method: method,
       headers: {
-        Authorization: `Basic ${credentials}`,
+        'Authorization': `Basic ${credentials}`,
         'Content-Type': 'application/json'
       }
     });
-
+    
     if (!response.ok) {
       throw new Error(`Xirsys API error: ${response.status} - ${response.statusText}`);
     }
-
-    return await response.json();
+    
+    const data = await response.json();
+    console.log(`✅ Xirsys ${service} response:`, data);
+    return data;
+    
   } catch (error) {
-    console.error(`❌ Xirsys API call failed (${service}):`, error.message);
+    console.error(`❌ Xirsys API call failed for ${service}:`, error.message);
     throw error;
   }
 }
 
-// HTTP Server
+async function getXirsysLiveSessions() {
+  try {
+    console.log('🔍 Fetching Xirsys live sessions...');
+    
+    let liveSessions = [];
+    
+    // First, try to ensure the namespace exists
+    try {
+      console.log('🏗️ Ensuring Xirsys namespace exists...');
+      const createNs = await xirsysApiCall('_ns', '', 'PUT');
+      console.log('🏗️ Namespace creation result:', createNs);
+    } catch (e) {
+      console.log('🏗️ Namespace creation skipped:', e.message);
+    }
+    
+    // Method 1: Check TURN service activity (most reliable for active calls)
+    try {
+      const turnData = await xirsysApiCall('_turn');
+      console.log('🔄 TURN data:', turnData);
+      if (turnData && turnData.s === 'ok' && turnData.v) {
+        // TURN service shows active ICE sessions
+        if (turnData.v.iceServers || turnData.v.length > 0) {
+          console.log('🔄 TURN service indicates potential active sessions');
+        }
+      }
+    } catch (e) {
+      console.log('🔄 TURN endpoint not accessible:', e.message);
+    }
+    
+    // Method 2: Check stats for any activity
+    try {
+      const statsData = await xirsysApiCall('_stats');
+      console.log('📈 Full stats response:', JSON.stringify(statsData, null, 2));
+      
+      if (statsData && statsData.s === 'ok') {
+        if (Array.isArray(statsData.v) && statsData.v.length > 0) {
+          // Process stats data
+          statsData.v.forEach((stat, index) => {
+            console.log(`📊 Stat ${index}:`, stat);
+            if (stat && (stat.active > 0 || stat.sessions > 0 || stat.users > 0)) {
+              liveSessions.push({
+                roomId: stat.path || stat.channel || `session_${index}`,
+                roomCode: stat.path || stat.channel || `session_${index}`,
+                participants: [],
+                participantCount: stat.active || stat.users || 1,
+                status: 'live',
+                type: 'webrtc_call',
+                startTime: new Date().toISOString(),
+                platform: 'xirsys',
+                lastUpdated: new Date().toISOString(),
+                statData: stat
+              });
+            }
+          });
+        } else if (statsData.v && typeof statsData.v === 'object') {
+          // Handle object format stats
+          Object.keys(statsData.v).forEach(key => {
+            const value = statsData.v[key];
+            console.log(`📊 Stats key ${key}:`, value);
+            if (value && value > 0) {
+              liveSessions.push({
+                roomId: key,
+                roomCode: key,
+                participants: [],
+                participantCount: value,
+                status: 'live',
+                type: 'webrtc_call',
+                startTime: new Date().toISOString(),
+                platform: 'xirsys',
+                lastUpdated: new Date().toISOString()
+              });
+            }
+          });
+        }
+      }
+    } catch (e) {
+      console.log('📈 Stats processing failed:', e.message);
+    }
+    
+    // Method 3: Try simpler namespace check
+    try {
+      const nsData = await xirsysApiCall('_ns', '');
+      console.log('🗂️ Root namespace check:', nsData);
+    } catch (e) {
+      console.log('🗂️ Root namespace error:', e.message);
+    }
+    
+    console.log(`📊 Found ${liveSessions.length} live sessions from Xirsys`);
+    
+    // For testing: Create a mock session when your match.html is used
+    if (liveSessions.length === 0) {
+      console.log('🧪 No live sessions detected - this is normal if no video calls are active');
+    }
+    
+    return liveSessions;
+    
+  } catch (error) {
+    console.error('❌ Failed to get Xirsys live sessions:', error);
+    return [];
+  }
+}
+
+async function getCombinedLiveMatches() {
+  try {
+    // Get your local rooms
+    let rooms = [];
+    if (SUPABASE_URL && SUPABASE_KEY) {
+      const { data, error } = await supabase
+        .from('rooms')
+        .select('*')
+        .neq('status', 'ended') // Filter out ended rooms
+        .order('created', { ascending: false });
+      
+      if (!error) {
+        rooms = data || [];
+      }
+    } else {
+      rooms = global.rooms ? Array.from(global.rooms.values()).filter(r => r.status !== 'ended') : [];
+    }
+    
+    // Get live Xirsys sessions
+    const xirsysLiveSessions = await getXirsysLiveSessions();
+    
+    // Create a map of live sessions by room code
+    const liveSessionMap = new Map();
+    xirsysLiveSessions.forEach(session => {
+      liveSessionMap.set(session.roomId, session);
+    });
+    
+    // Merge room data with live session data and active video rooms
+    const liveMatches = rooms.map(room => {
+      const liveSession = liveSessionMap.get(room.code);
+      const activeParticipants = activeVideoRooms.has(room.code) 
+        ? activeVideoRooms.get(room.code).size 
+        : 0;
+      
+      return {
+        ...room,
+        hasLiveSession: activeParticipants > 0 || !!liveSession,
+        liveSession: liveSession,
+        actualParticipants: activeParticipants || liveSession?.participantCount || 0,
+        status: activeParticipants > 0 ? 'live' : (liveSession ? 'live' : room.status),
+        xirsysStatus: liveSession ? 'connected' : 'disconnected'
+      };
+    });
+    
+    // Also include Xirsys sessions that don't match existing rooms
+    xirsysLiveSessions.forEach(session => {
+      const existingRoom = rooms.find(room => room.code === session.roomId);
+      if (!existingRoom) {
+        liveMatches.push({
+          code: session.roomId,
+          host: 'Unknown',
+          opponent: session.participantCount > 1 ? 'Unknown' : null,
+          players: session.participantCount,
+          max_players: 4,
+          status: 'live',
+          created: session.startTime,
+          hasLiveSession: true,
+          liveSession: session,
+          actualParticipants: session.participantCount,
+          xirsysStatus: 'connected',
+          isXirsysOnly: true
+        });
+      }
+    });
+    
+    return liveMatches;
+    
+  } catch (error) {
+    console.error('❌ Error getting combined live matches:', error);
+    throw error;
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   const parsedUrl = url.parse(req.url, true);
   const path = parsedUrl.pathname;
   const method = req.method;
   const origin = req.headers.origin;
 
+  console.log(`${method} ${path} from ${origin}`);
+
+  // Handle preflight OPTIONS requests
   if (method === 'OPTIONS') {
     setCORSHeaders(res, origin);
     res.writeHead(200);
@@ -102,63 +406,476 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Set CORS headers for all responses
   setCORSHeaders(res, origin);
 
-  // Health check
-  if (path === '/api/health' && method === 'GET') {
-    let xirsysStatus = 'unknown';
-    try {
-      await xirsysApiCall('_turn');
-      xirsysStatus = 'connected';
-    } catch {
-      xirsysStatus = 'error';
-    }
-
-    sendJSON(res, { status: 'healthy', xirsysStatus }, 200, origin);
+  // Root endpoint
+  if (path === '/' && method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(`
+      <h1>DDL Arena Backend Server</h1>
+      <p>Server is running successfully.</p>
+      <p>Time: ${new Date().toISOString()}</p>
+      <p>Environment: ${process.env.NODE_ENV || 'development'}</p>
+      <p>WebRTC Signaling: ✅ Enabled</p>
+      <p>Xirsys Integration: ✅ Active (${XIRSYS_CONFIG.ident})</p>
+      <p>Room Cleanup: ✅ Automatic</p>
+    `);
     return;
   }
 
-  // Get ICE servers (Xirsys-first)
+  // Enhanced health check endpoint with Xirsys status
+  if (path === '/api/health' && method === 'GET') {
+    let xirsysStatus = 'unknown';
+    try {
+      await xirsysApiCall('_subs');
+      xirsysStatus = 'connected';
+    } catch (e) {
+      xirsysStatus = 'error';
+    }
+    
+    sendJSON(res, { 
+      status: 'healthy', 
+      timestamp: new Date().toISOString(), 
+      server: 'DDL Arena Backend',
+      version: '1.1.0',
+      features: ['rooms', 'webrtc-signaling', 'xirsys-integration', 'auto-cleanup'],
+      xirsys: {
+        status: xirsysStatus,
+        ident: XIRSYS_CONFIG.ident,
+        gateway: XIRSYS_CONFIG.gateway,
+        path: XIRSYS_CONFIG.path
+      },
+      activeRooms: activeVideoRooms.size
+    }, 200, origin);
+    return;
+  }
+
+  // Test Xirsys connection
+  if (path === '/api/xirsys/test' && method === 'GET') {
+    try {
+      console.log('🧪 Testing Xirsys connection...');
+      
+      const testResult = {
+        config: {
+          ident: XIRSYS_CONFIG.ident,
+          gateway: XIRSYS_CONFIG.gateway,
+          path: XIRSYS_CONFIG.path
+        },
+        timestamp: new Date().toISOString()
+      };
+      
+      // Test different endpoints to find what works
+      const endpoints = ['_ns', '_data', '_host', '_stats', '_turn'];
+      
+      for (const endpoint of endpoints) {
+        try {
+          const data = await xirsysApiCall(endpoint);
+          testResult[`${endpoint}Test`] = { success: true, data: data };
+        } catch (e) {
+          testResult[`${endpoint}Test`] = { success: false, error: e.message };
+        }
+      }
+      
+      sendJSON(res, testResult, 200, origin);
+      
+    } catch (error) {
+      console.error('❌ Xirsys test failed:', error);
+      sendJSON(res, { error: 'Xirsys test failed', details: error.message }, 500, origin);
+    }
+    return;
+  }
+
+  // Get ICE servers from Xirsys for WebRTC
   if (path === '/api/ice-servers' && method === 'GET') {
     try {
-      let iceData;
+      console.log('🧊 Getting ICE servers from Xirsys...');
+      
+      // Try to get TURN servers from Xirsys
       try {
-        console.log('🧊 Fetching ICE servers from Xirsys...');
-        iceData = await xirsysApiCall('_turn', '', 'PUT');
-        if (iceData?.s === 'ok' && iceData.v?.iceServers) {
-          sendJSON(res, { iceServers: iceData.v.iceServers }, 200, origin);
+        const turnData = await xirsysApiCall('_turn', '', 'PUT');
+        console.log('🔄 Xirsys TURN response:', turnData);
+        
+        if (turnData && turnData.s === 'ok' && turnData.v && turnData.v.iceServers) {
+          sendJSON(res, {
+            iceServers: turnData.v.iceServers
+          }, 200, origin);
           return;
         }
       } catch (e) {
-        console.error('Xirsys TURN fetch failed, using fallback:', e.message);
+        console.log('🔄 Xirsys TURN failed, using fallback:', e.message);
       }
-
-      const fallbackIceServers = [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        {
-          urls: 'turn:openrelay.metered.ca:80',
-          username: 'openrelayproject',
-          credential: 'openrelayproject'
-        },
-        {
-          urls: 'turn:openrelay.metered.ca:443',
-          username: 'openrelayproject',
-          credential: 'openrelayproject'
-        }
-      ];
-
-      sendJSON(res, { iceServers: fallbackIceServers }, 200, origin);
+      
+      // Fallback ICE servers if Xirsys doesn't work
+      const fallbackIceServers = {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+          { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' }
+        ]
+      };
+      
+      console.log('🧊 Using fallback ICE servers');
+      sendJSON(res, fallbackIceServers, 200, origin);
+      
     } catch (error) {
+      console.error('❌ Error getting ICE servers:', error);
       sendJSON(res, { error: 'Failed to get ICE servers' }, 500, origin);
     }
     return;
   }
 
-  sendJSON(res, { error: 'Not Found' }, 404, origin);
+  if (path === '/api/xirsys/live-sessions' && method === 'GET') {
+    try {
+      const liveSessions = await getXirsysLiveSessions();
+      sendJSON(res, liveSessions, 200, origin);
+    } catch (error) {
+      console.error('❌ Error fetching Xirsys live sessions:', error);
+      sendJSON(res, { error: 'Failed to fetch live sessions', details: error.message }, 500, origin);
+    }
+    return;
+  }
+
+  // Get combined live matches (your rooms + Xirsys data)
+  if (path === '/api/live-matches' && method === 'GET') {
+    try {
+      const liveMatches = await getCombinedLiveMatches();
+      sendJSON(res, liveMatches, 200, origin);
+    } catch (error) {
+      console.error('❌ Error fetching live matches:', error);
+      sendJSON(res, { error: 'Failed to fetch live matches', details: error.message }, 500, origin);
+    }
+    return;
+  }
+
+  // Check specific room status in Xirsys
+  if (path.startsWith('/api/xirsys/room/') && method === 'GET') {
+    const roomId = path.split('/')[4];
+    
+    try {
+      const roomData = await xirsysApiCall('_subs', `/${roomId}`);
+      const isLive = roomData && roomData.v && Object.keys(roomData.v || {}).length > 0;
+      
+      sendJSON(res, {
+        roomId: roomId,
+        isLive: isLive,
+        participants: isLive ? Object.keys(roomData.v || {}) : [],
+        participantCount: isLive ? Object.keys(roomData.v || {}).length : 0,
+        xirsysData: roomData
+      }, 200, origin);
+      
+    } catch (error) {
+      console.error(`❌ Error checking room ${roomId} status:`, error);
+      sendJSON(res, { error: 'Failed to check room status', details: error.message }, 500, origin);
+    }
+    return;
+  }
+
+  // Create room endpoint
+  if (path === '/api/rooms' && method === 'POST') {
+    parseBody(req, async (err, body) => {
+      if (err) {
+        sendJSON(res, { error: 'Invalid JSON' }, 400, origin);
+        return;
+      }
+
+      try {
+        const { host, gameSettings } = body;
+        
+        if (!host) {
+          sendJSON(res, { error: 'Host username is required' }, 400, origin);
+          return;
+        }
+
+        const roomCode = generateRoomCode();
+        const roomData = {
+          code: roomCode,
+          host: host,
+          host_id: `host_${Date.now()}`,
+          players: 1,
+          max_players: 2,
+          status: 'waiting',
+          game_settings: gameSettings || {
+            startingScore: 501,
+            legsToWin: 3,
+            setsToWin: 1,
+            doubleOut: true
+          },
+          created: new Date().toISOString(),
+          is_live: false
+        };
+
+        console.log('Creating room:', roomData);
+
+        // Store in Supabase if available, otherwise use in-memory storage
+        if (SUPABASE_URL && SUPABASE_KEY) {
+          const { data, error } = await supabase
+            .from('rooms')
+            .insert([roomData])
+            .select();
+
+          if (error) {
+            console.error('Supabase error:', error);
+            sendJSON(res, { error: 'Database error' }, 500, origin);
+            return;
+          }
+
+          sendJSON(res, data[0], 201, origin);
+        } else {
+          // In-memory storage fallback
+          if (!global.rooms) global.rooms = new Map();
+          global.rooms.set(roomCode, roomData);
+          sendJSON(res, roomData, 201, origin);
+        }
+
+      } catch (error) {
+        console.error('Create room error:', error);
+        sendJSON(res, { error: 'Internal server error' }, 500, origin);
+      }
+    });
+    return;
+  }
+
+  // Get rooms endpoint - filters out ended rooms
+  if (path === '/api/rooms' && method === 'GET') {
+    try {
+      let rooms = [];
+
+      if (SUPABASE_URL && SUPABASE_KEY) {
+        const { data, error } = await supabase
+          .from('rooms')
+          .select('*')
+          .neq('status', 'ended') // Filter out ended rooms
+          .order('created', { ascending: false });
+
+        if (error) {
+          console.error('Supabase error:', error);
+          sendJSON(res, { error: 'Database error' }, 500, origin);
+          return;
+        }
+
+        rooms = data || [];
+      } else {
+        // In-memory storage fallback
+        if (global.rooms) {
+          rooms = Array.from(global.rooms.values())
+            .filter(room => room.status !== 'ended'); // Filter out ended rooms
+        }
+      }
+
+      // Add real-time participant counts from active video rooms
+      rooms = rooms.map(room => ({
+        ...room,
+        actualParticipants: activeVideoRooms.has(room.code) 
+          ? activeVideoRooms.get(room.code).size 
+          : 0,
+        hasLiveSession: activeVideoRooms.has(room.code) && activeVideoRooms.get(room.code).size > 0
+      }));
+
+      sendJSON(res, rooms, 200, origin);
+
+    } catch (error) {
+      console.error('Get rooms error:', error);
+      sendJSON(res, { error: 'Internal server error' }, 500, origin);
+    }
+    return;
+  }
+
+  // Get specific room endpoint
+  if (path.startsWith('/api/rooms/') && method === 'GET') {
+    const roomCode = path.split('/')[3];
+    
+    try {
+      let room = null;
+
+      if (SUPABASE_URL && SUPABASE_KEY) {
+        const { data, error } = await supabase
+          .from('rooms')
+          .select('*')
+          .eq('code', roomCode)
+          .single();
+
+        if (error) {
+          sendJSON(res, { error: 'Room not found' }, 404, origin);
+          return;
+        }
+
+        room = data;
+      } else {
+        // In-memory storage fallback
+        if (global.rooms && global.rooms.has(roomCode)) {
+          room = global.rooms.get(roomCode);
+        }
+      }
+
+      if (!room) {
+        sendJSON(res, { error: 'Room not found' }, 404, origin);
+        return;
+      }
+
+      sendJSON(res, room, 200, origin);
+
+    } catch (error) {
+      console.error('Get room error:', error);
+      sendJSON(res, { error: 'Internal server error' }, 500, origin);
+    }
+    return;
+  }
+
+  // Join room endpoint
+  if (path.startsWith('/api/rooms/') && path.endsWith('/join') && method === 'POST') {
+    const roomCode = path.split('/')[3];
+    
+    parseBody(req, async (err, body) => {
+      if (err) {
+        sendJSON(res, { error: 'Invalid JSON' }, 400, origin);
+        return;
+      }
+
+      try {
+        const { username } = body;
+        
+        if (!username) {
+          sendJSON(res, { error: 'Username is required' }, 400, origin);
+          return;
+        }
+
+        let room = null;
+
+        if (SUPABASE_URL && SUPABASE_KEY) {
+          const { data, error } = await supabase
+            .from('rooms')
+            .select('*')
+            .eq('code', roomCode)
+            .single();
+
+          if (error) {
+            sendJSON(res, { error: 'Room not found' }, 404, origin);
+            return;
+          }
+
+          room = data;
+
+          // Update room with new player
+          const updatedRoom = {
+            ...room,
+            opponent: username,
+            opponent_id: `player_${Date.now()}`,
+            players: 2,
+            status: 'ready'
+          };
+
+          const { data: updateData, error: updateError } = await supabase
+            .from('rooms')
+            .update(updatedRoom)
+            .eq('code', roomCode)
+            .select();
+
+          if (updateError) {
+            sendJSON(res, { error: 'Failed to join room' }, 500, origin);
+            return;
+          }
+
+          sendJSON(res, updateData[0], 200, origin);
+
+        } else {
+          // In-memory storage fallback
+          if (!global.rooms || !global.rooms.has(roomCode)) {
+            sendJSON(res, { error: 'Room not found' }, 404, origin);
+            return;
+          }
+
+          room = global.rooms.get(roomCode);
+          
+          const updatedRoom = {
+            ...room,
+            opponent: username,
+            opponent_id: `player_${Date.now()}`,
+            players: 2,
+            status: 'ready'
+          };
+
+          global.rooms.set(roomCode, updatedRoom);
+          sendJSON(res, updatedRoom, 200, origin);
+        }
+
+      } catch (error) {
+        console.error('Join room error:', error);
+        sendJSON(res, { error: 'Internal server error' }, 500, origin);
+      }
+    });
+    return;
+  }
+
+  // Delete room endpoint
+  if (path.startsWith('/api/rooms/') && method === 'DELETE') {
+    const roomCode = path.split('/')[3];
+    
+    try {
+      if (SUPABASE_URL && SUPABASE_KEY) {
+        const { error } = await supabase
+          .from('rooms')
+          .delete()
+          .eq('code', roomCode);
+
+        if (error) {
+          sendJSON(res, { error: 'Failed to delete room' }, 500, origin);
+          return;
+        }
+      } else {
+        // In-memory storage fallback
+        if (global.rooms) {
+          global.rooms.delete(roomCode);
+        }
+      }
+
+      sendJSON(res, { message: 'Room deleted' }, 200, origin);
+
+    } catch (error) {
+      console.error('Delete room error:', error);
+      sendJSON(res, { error: 'Internal server error' }, 500, origin);
+    }
+    return;
+  }
+
+  // Add an explicit end-call endpoint for clean disconnects
+  if (path === '/api/rooms/end-call' && method === 'POST') {
+    parseBody(req, async (err, body) => {
+      if (err) {
+        sendJSON(res, { error: 'Invalid JSON' }, 400, origin);
+        return;
+      }
+
+      try {
+        const { roomCode } = body;
+        
+        if (!roomCode) {
+          sendJSON(res, { error: 'Room code is required' }, 400, origin);
+          return;
+        }
+
+        // Clean up the room
+        await cleanupRoom(roomCode);
+        
+        // Notify all clients in the room via Socket.IO
+        io.to(roomCode).emit('room-ended', { roomCode });
+        
+        sendJSON(res, { message: 'Room ended successfully' }, 200, origin);
+        
+      } catch (error) {
+        console.error('End call error:', error);
+        sendJSON(res, { error: 'Internal server error' }, 500, origin);
+      }
+    });
+    return;
+  }
+
+  // 404 for unmatched routes
+  sendJSON(res, { error: 'Not found' }, 404, origin);
 });
 
-// WebSocket / Socket.IO
+// Enhanced Socket.IO setup with WebRTC signaling
 const io = new Server(server, {
   cors: {
     origin: ALLOWED_ORIGINS,
@@ -167,43 +884,202 @@ const io = new Server(server, {
   }
 });
 
-io.on('connection', socket => {
+io.on('connection', (socket) => {
   console.log('🔌 Client connected:', socket.id);
 
-  socket.on('join-video-room', ({ roomId, username }) => {
+  // Legacy room functionality (keep for compatibility)
+  socket.on('join-room', roomCode => {
+    console.log(`📱 Legacy join-room: ${socket.id} -> ${roomCode}`);
+    socket.join(roomCode);
+    socket.to(roomCode).emit('user-joined', socket.id);
+  });
+
+  socket.on('signal', ({ roomCode, data }) => {
+    console.log(`📡 Legacy signal: ${socket.id} -> ${roomCode}`);
+    socket.to(roomCode).emit('signal', { sender: socket.id, data });
+  });
+
+  // Enhanced WebRTC video room functionality with cleanup
+  socket.on('join-video-room', async (data) => {
+    const { roomId, username } = data;
+    console.log(`🎥 ${username} joining video room: ${roomId}`);
+
+    // Leave any previous room
+    socket.rooms.forEach(room => {
+      if (room !== socket.id) {
+        socket.leave(room);
+      }
+    });
+
+    // Join the new room
     socket.join(roomId);
+    socket.roomId = roomId;
+    socket.username = username;
+
+    // Track user in room
     if (!activeVideoRooms.has(roomId)) {
       activeVideoRooms.set(roomId, new Set());
     }
     activeVideoRooms.get(roomId).add(socket.id);
     userSockets.set(socket.id, { roomId, username });
-    socket.to(roomId).emit('user-joined', { socketId: socket.id, username });
-  });
 
-  socket.on('webrtc-offer', ({ targetSocketId, offer }) => {
-    socket.to(targetSocketId).emit('webrtc-offer', { fromSocketId: socket.id, offer });
-  });
-
-  socket.on('webrtc-answer', ({ targetSocketId, answer }) => {
-    socket.to(targetSocketId).emit('webrtc-answer', { fromSocketId: socket.id, answer });
-  });
-
-  socket.on('webrtc-ice-candidate', ({ targetSocketId, candidate }) => {
-    socket.to(targetSocketId).emit('webrtc-ice-candidate', { fromSocketId: socket.id, candidate });
-  });
-
-  socket.on('disconnect', () => {
-    const userInfo = userSockets.get(socket.id);
-    if (userInfo) {
-      const { roomId } = userInfo;
-      activeVideoRooms.get(roomId)?.delete(socket.id);
-      socket.to(roomId).emit('user-left', { socketId: socket.id });
-      userSockets.delete(socket.id);
+    // Update room lifecycle
+    if (!roomLifecycle.has(roomId)) {
+      roomLifecycle.set(roomId, {
+        created: new Date(),
+        lastActivity: new Date(),
+        status: 'active',
+        participants: new Set()
+      });
     }
+    const lifecycle = roomLifecycle.get(roomId);
+    lifecycle.lastActivity = new Date();
+    lifecycle.participants.add(socket.id);
+
+    // Update room status in database
+    await updateRoomStatus(roomId, 'active', activeVideoRooms.get(roomId).size);
+
+    // Notify others in room
+    socket.to(roomId).emit('user-joined', {
+      socketId: socket.id,
+      username: username
+    });
+
+    // Send current room users to the new user
+    const roomUsers = Array.from(activeVideoRooms.get(roomId))
+      .filter(id => id !== socket.id)
+      .map(id => ({
+        socketId: id,
+        username: userSockets.get(id)?.username
+      }));
+
+    socket.emit('room-users', roomUsers);
+
+    console.log(`✅ ${username} joined room ${roomId}. Total users: ${activeVideoRooms.get(roomId).size}`);
+  });
+
+  // WebRTC offer handling
+  socket.on('webrtc-offer', (data) => {
+    const { targetSocketId, offer } = data;
+    console.log(`📤 Relaying offer from ${socket.id} to ${targetSocketId}`);
+
+    socket.to(targetSocketId).emit('webrtc-offer', {
+      fromSocketId: socket.id,
+      offer: offer
+    });
+  });
+
+  // WebRTC answer handling
+  socket.on('webrtc-answer', (data) => {
+    const { targetSocketId, answer } = data;
+    console.log(`📥 Relaying answer from ${socket.id} to ${targetSocketId}`);
+
+    socket.to(targetSocketId).emit('webrtc-answer', {
+      fromSocketId: socket.id,
+      answer: answer
+    });
+  });
+
+  // ICE candidate handling
+  socket.on('webrtc-ice-candidate', (data) => {
+    const { targetSocketId, candidate } = data;
+    console.log(`🧊 Relaying ICE candidate from ${socket.id} to ${targetSocketId}`);
+
+    socket.to(targetSocketId).emit('webrtc-ice-candidate', {
+      fromSocketId: socket.id,
+      candidate: candidate
+    });
+  });
+
+  // Generic WebRTC signal handling (for flexibility)
+  socket.on('webrtc-signal', (data) => {
+    const { targetSocketId, signal, type } = data;
+    console.log(`📡 Relaying ${type} signal from ${socket.id} to ${targetSocketId}`);
+
+    socket.to(targetSocketId).emit('webrtc-signal', {
+      fromSocketId: socket.id,
+      signal: signal,
+      type: type
+    });
+  });
+
+  // Handle explicit leave room
+  socket.on('leave-room', async () => {
+    await handleUserLeaveRoom(socket, io);
+  });
+
+  // Handle explicit leave video room
+  socket.on('leave-video-room', async () => {
+    await handleUserLeaveRoom(socket, io);
+  });
+
+  // Handle disconnection
+  socket.on('disconnect', async () => {
+    console.log('📴 Client disconnected:', socket.id);
+    await handleUserLeaveRoom(socket, io);
   });
 });
 
+// Periodic cleanup for stale rooms
+setInterval(async () => {
+  console.log('🔄 Running periodic room cleanup...');
+  
+  const now = Date.now();
+  const STALE_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+  
+  // Clean up stale rooms in lifecycle tracker
+  for (const [roomId, lifecycle] of roomLifecycle.entries()) {
+    const lastActivity = lifecycle.lastActivity.getTime();
+    
+    if (lifecycle.status === 'ended' || 
+        (lifecycle.participants.size === 0 && now - lastActivity > STALE_TIMEOUT)) {
+      await cleanupRoom(roomId);
+      console.log(`🧹 Cleaned up stale room: ${roomId}`);
+    }
+  }
+  
+  // Also clean up database rooms marked as ended or inactive
+  if (SUPABASE_URL && SUPABASE_KEY) {
+    try {
+      // Delete rooms that have been ended for more than 30 minutes
+      const thirtyMinutesAgo = new Date(now - STALE_TIMEOUT).toISOString();
+      
+      const { error } = await supabase
+        .from('rooms')
+        .delete()
+        .or(`status.eq.ended,and(is_live.eq.false,last_activity.lt.${thirtyMinutesAgo})`);
+      
+      if (error) {
+        console.error('Failed to clean up stale rooms:', error);
+      }
+    } catch (error) {
+      console.error('Error in periodic cleanup:', error);
+    }
+  }
+  
+}, 5 * 60 * 1000); // Run every 5 minutes
+
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 DDL Arena Server is running on port ${PORT}`);
+  console.log(`🌐 Allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
+  console.log(`🗄️ Database: ${SUPABASE_URL ? 'Supabase' : 'In-memory (fallback)'}`);
+  console.log(`🎥 WebRTC Signaling: ✅ Enhanced & Ready`);
+  console.log(`🎯 Xirsys Integration: ✅ Active`);
+  console.log(`   - Ident: ${XIRSYS_CONFIG.ident}`);
+  console.log(`   - Gateway: ${XIRSYS_CONFIG.gateway}`);
+  console.log(`   - Path: ${XIRSYS_CONFIG.path}`);
+  console.log(`🧹 Auto-cleanup: ✅ Enabled (5 min intervals)`);
+});
+
+server.on('error', (err) => {
+  console.error('Server error:', err);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err);
 });
